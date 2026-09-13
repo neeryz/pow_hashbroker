@@ -1,24 +1,29 @@
 #!/usr/bin/env python3
 # ============================================================================
-#  HashBroker 本地 GPU 挖矿器 (单文件, NVIDIA GPU)
-#  链上 SHA-256 工作量证明 -> 免费 mint (只花 gas)。挖到就自动用你的钱包提交。
+#  HashBroker local GPU miner (single file, NVIDIA GPU)
+#  On-chain SHA-256 proof-of-work -> free mint (gas only). Auto-submits with
+#  your wallet when a solution is found.
 #
-#  依赖:  pip install pyopencl eth-account
-#  用法:  设置环境变量 PK=你的钱包私钥(0x...), 然后 python hashbroker.py
-#         可选 COUNT=挖几个(默认一直挖到开始收费)。停: Ctrl+C。
+#  Deps:  pip install pyopencl eth-account
+#  Usage: set environment variable PK=your wallet private key (0x...), then
+#         python hashbroker.py
+#         optional COUNT=how many to mine (default: keep going until paid
+#         minting starts). Stop: Ctrl+C.
 #
-#  原理: preimage = 地址(20) || 零(24) || nonce(8) || challenge(32)  -> SHA-256
-#        需前导零 bit >= 链上 currentDifficulty(); 提交 mine(nonce, challenge)。
-#        challenge 每当有人 mint 就变 -> 本器盯着, 变了自动换新 challenge 重挖,
-#        挖到后先验 challenge 未过期再提交(否则会被抢先/revert)。
-#  ⚠️ 竞争: 难度随全局供应上涨, 算力要压过 challenge 刷新率才稳中。单卡靠运气窗口。
+#  Principle: preimage = address(20) || zeros(24) || nonce(8) || challenge(32)  ->  SHA-256
+#        needs leading zero bits >= on-chain currentDifficulty(); submit mine(nonce, challenge).
+#        The challenge changes every time someone mints -> this miner watches for it and
+#        automatically switches to the new challenge and re-mines. Before submitting it
+#        verifies the challenge hasn't expired (otherwise it gets sniped/reverts).
+#  ⚠️ Competition: difficulty rises with global supply; your hashrate needs to beat
+#     the challenge refresh rate for consistent hits. A single card relies on luck windows.
 # ============================================================================
 import os, sys, time, json, struct, urllib.request
 import numpy as np
 import pyopencl as cl
 from eth_account import Account
 
-# ---- 配置 (换项目改这里) ----
+# ---- Config (edit here to switch projects) ----
 RPC      = "https://rpc.mainnet.chain.robinhood.com"
 CONTRACT = "0x4272D6f51771839F596082eF48fa84D35239Bab3"
 CHAIN_ID = 4663
@@ -29,14 +34,14 @@ SEL_MINE       = "0xe43e322c"   # mine(uint256 nonce, bytes32 challenge)
 
 PK = os.environ.get("PK", "").strip()
 if not PK:
-    sys.exit("请设置环境变量 PK=你的钱包私钥 (0x...)")
+    sys.exit("Please set the environment variable PK=your wallet private key (0x...)")
 acct = Account.from_key(PK)
 ADDR = acct.address
 COUNT = int(os.environ.get("COUNT", "999"))
 
 def rpc(method, params):
     body = json.dumps({"jsonrpc": "2.0", "id": 1, "method": method, "params": params}).encode()
-    # 注意: 很多 RPC 不带 User-Agent 会 403, 必须带上
+    # note: many RPCs return 403 without a User-Agent — always send one
     req = urllib.request.Request(RPC, data=body, headers={"content-type": "application/json", "user-agent": "Mozilla/5.0"})
     r = json.loads(urllib.request.urlopen(req, timeout=20).read())
     if "error" in r: raise RuntimeError(r["error"])
@@ -49,7 +54,7 @@ def challenge():   return call(SEL_CHALLENGE)            # 0x + 64 hex
 def difficulty():  return int(call(SEL_DIFFICULTY), 16)
 def mint_price():  return int(call(SEL_PRICE), 16)
 
-# ---- OpenCL 挖矿 (NVIDIA) ----
+# ---- OpenCL mining (NVIDIA) ----
 dev = None
 for p in cl.get_platforms():
     if "NVIDIA" in p.name: dev = p.get_devices()[0]; break
@@ -89,7 +94,7 @@ __kernel void mine(ulong base,__global volatile int* found,__global ulong* out){
 """
 
 def mine(ch_hex, diff, check_stale):
-    """挖当前 challenge。返回 nonce(int) 或 None(challenge 变了/需重挖)。"""
+    """Mine the current challenge. Returns a nonce (int) or None (challenge changed / needs re-mining)."""
     addr_w = struct.unpack(">5I", bytes.fromhex(ADDR[2:]))
     ch_w   = struct.unpack(">8I", bytes.fromhex(ch_hex[2:]))
     ITERS = 4096
@@ -113,7 +118,7 @@ def mine(ch_hex, diff, check_stale):
             cl.enqueue_copy(q, out, og); q.finish(); return int(out[0])
         if now-last>=5:
             print(f"  {tot/(now-t0)/1e9:.1f} GH/s  best-effort mining diff {diff}…", flush=True); last=now
-        if now-lastchk>=12 and check_stale():   # challenge 变了 -> 重挖
+        if now-lastchk>=12 and check_stale():   # challenge changed -> re-mine
             return None
         lastchk = now
 
@@ -134,18 +139,18 @@ got = 0
 try:
     while got < COUNT:
         if mint_price() != 0:
-            print(f"⛔ mintPrice 已非0(开始收费)。共免费挖到 {got} 个,停止。"); break
+            print(f"⛔ mintPrice is non-zero (paid minting started). Free mints so far: {got}. Stopping."); break
         ch = challenge(); diff = difficulty()
-        print(f"[{time.strftime('%H:%M:%S')}] 挖 challenge {ch[:12]}… 难度 {diff}", flush=True)
+        print(f"[{time.strftime('%H:%M:%S')}] mining challenge {ch[:12]}… difficulty {diff}", flush=True)
         stale = lambda: challenge().lower() != ch.lower()
         nonce = mine(ch, diff, stale)
         if nonce is None:
-            print("  challenge 变了 → 重挖"); continue
+            print("  challenge changed → re-mining"); continue
         if challenge().lower() != ch.lower():
-            print("  解出但 challenge 已过期 → 重挖"); continue
+            print("  solved but challenge expired → re-mining"); continue
         ok, txh = submit(nonce, ch)
-        if ok: got += 1; print(f"  ✓ 挖到并 mint 成功! nonce {nonce}  tx {txh}")
-        else:  print(f"  ✗ 提交 revert(被抢先/过期)→ 重挖  {txh[:12]}")
-    print(f"=== 结束 · 共免费挖到 {got} 个 ===")
+        if ok: got += 1; print(f"  ✓ found and minted! nonce {nonce}  tx {txh}")
+        else:  print(f"  ✗ submission reverted (sniped/expired) → re-mining  {txh[:12]}")
+    print(f"=== done · total free mints: {got} ===")
 except KeyboardInterrupt:
-    print(f"\n已停止 · 共免费挖到 {got} 个")
+    print(f"\nstopped · total free mints: {got}")

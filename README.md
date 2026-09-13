@@ -1,40 +1,40 @@
 # pow_hashbroker
 
-本地 GPU 挖 **链上 PoW 免费 mint** 的 NFT（如 HashBroker 类）。算出满足难度的 nonce → 提交 `mine(nonce, challenge)`，value=0，**只花 gas**。
+Local GPU mining for **on-chain PoW free mint** NFTs (HashBroker-style). Find a nonce meeting the difficulty → submit `mine(nonce, challenge)`, value=0, **gas only**.
 
-- `hashbroker/hashbroker.py` — 自包含挖矿器（pyopencl 算 SHA-256 + eth-account 提交），单文件，改顶部配置即可换项目。
-- `hashbroker/SKILL.md` — 一个 Claude Code skill，让你自己的 Claude 帮你从零建一个本地挖矿器。
+- `hashbroker/hashbroker.py` — self-contained miner (pyopencl SHA-256 + eth-account submission). Single file; change the config at the top to repurpose for another project.
+- `hashbroker/SKILL.md` — a [CC] skill so your own Claude can build a local miner from scratch.
 
-## 原理
+## How it works
 
 ```
-preimage = 地址(20) || 零(24) || nonce(8) || challenge(32)   ->  SHA-256
-需前导零 bit >= 链上 currentDifficulty()，满足就提交 mine(nonce, challenge)
+preimage = address(20) || zeros(24) || nonce(8) || challenge(32)   ->  SHA-256
+needs leading zero bits >= on-chain currentDifficulty(); when satisfied, submit mine(nonce, challenge)
 ```
 
-challenge 每当有人 mint 就变，脚本会盯着自动换新题重挖；提交前再验一次没过期。难度随全局供应上涨，人越多越慢——**这是抽奖，不是跑完所有**，运气好早出，想快只有加算力。
+The challenge changes every time someone mints; the script watches for it and automatically switches to the new one and re-mines. Before submitting it verifies the challenge hasn't expired. Difficulty rises with global supply — the more people, the slower. **This is a lottery, not a finite search**: with luck a solution comes early; the only way to be faster is more hashrate.
 
-## 用法
+## Usage
 
 ```bash
 pip install pyopencl eth-account numpy
 
-# 只用小号 burner 私钥！
-export PK=0x你的burner私钥        # Windows PowerShell: $env:PK="0x..."
-export COUNT=1                    # 可选，挖几个（默认一直挖到开始收费）
+# use a small burner private key ONLY!
+export PK=0xyourburnerkey        # Windows PowerShell: $env:PK="0x..."
+export COUNT=1                    # optional, how many to mine (default: keep going until paid minting starts)
 python hashbroker/hashbroker.py
 ```
 
-实测 RTX 5090 ≈ 15.4 GH/s。期望解题时间 = `2^难度 / 算力`：难度 42 约 5 分钟，每升 1 级翻倍。
+Measured on an RTX 5090: ≈ 15.4 GH/s. Expected time to solve = `2^difficulty / hashrate`: difficulty 42 ≈ 5 minutes, doubling with each +1 level.
 
-换别的 PoW 项目：改 `hashbroker.py` 顶部的 `RPC / CONTRACT / CHAIN_ID / 各 selector`，并按该项目前端核对 preimage 布局。
+To repurpose for another PoW project: edit `RPC / CONTRACT / CHAIN_ID / selectors` at the top of `hashbroker.py`, and verify the preimage layout against that project's frontend.
 
-## ⚠️ 安全红线
+## ⚠️ Safety rules
 
-- **只用 burner 小号私钥**，私钥只放本机环境变量，绝不硬编码、绝不贴群/上传。脚本只做"读合约 + 算哈什 + 提交 mine"，不转账、不签别的。
-- **拒绝变种骗局**：若某项目让你跑*它给的可执行文件*，或用*它给的公钥*去磨 vanity 地址（如 `profanity2 -z <公钥>`）——那是替骗子磨私钥+骗你充值，坚决不碰。只跑看得懂的开源脚本、只用自己的钱包。
-- 开始收费（`mintPrice != 0`）脚本会自动停，不会偷偷帮你付钱。
+- **Use a burner private key only**; keep the key in a local environment variable — never hardcode it, never paste it into chats or upload it. The script only does "read contract + hash + submit mine" — no transfers, no other signatures.
+- **Reject variant scams**: if a project asks you to run *its executable*, or grind a vanity address with *its public key* (e.g. `profanity2 -z <pubkey>`) — that's grinding a private key for the scammer + baiting you to deposit. Hard pass. Only run open-source scripts you can read, only with your own wallet.
+- If paid minting starts (`mintPrice != 0`), the script stops automatically — it will never quietly pay for you.
 
 ## License
 
-[MIT](LICENSE) — 按原样提供，作者不对任何损失负责，风险自负。
+[MIT](LICENSE) — provided as-is, the author is not responsible for any losses. Use at your own risk.
