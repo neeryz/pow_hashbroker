@@ -54,15 +54,17 @@ def challenge():   return call(SEL_CHALLENGE)            # 0x + 64 hex
 def difficulty():  return int(call(SEL_DIFFICULTY), 16)
 def mint_price():  return int(call(SEL_PRICE), 16)
 
-# ---- OpenCL mining (NVIDIA) ----
-dev = None
+# ---- OpenCL mining (multi-GPU: every device on every platform, one thread per GPU) ----
+GPUS = []
 for p in cl.get_platforms():
-    if "NVIDIA" in p.name: dev = p.get_devices()[0]; break
-if dev is None:
-    devs = [d for pl in cl.get_platforms() for d in pl.get_devices()]
-    dev = devs[0]
-ctx = cl.Context([dev]); q = cl.CommandQueue(ctx)
-print(f"GPU: {dev.name} ({dev.max_compute_units} CU)  wallet: {ADDR}", flush=True)
+    for d in p.get_devices():
+        GPUS.append(d)
+if not GPUS:
+    sys.exit("❌ no OpenCL devices found")
+CTXS = {d: cl.Context([d]) for d in GPUS}
+print(f"GPUs: {len(GPUS)}  wallet: {ADDR}", flush=True)
+for i, d in enumerate(GPUS):
+    print(f"  [gpu{i}] {d.name} ({d.max_compute_units} CU)", flush=True)
 
 KERNEL = r"""
 __constant uint K[64]={0x428a2f98u,0x71374491u,0xb5c0fbcfu,0xe9b5dba5u,0x3956c25bu,0x59f111f1u,0x923f82a4u,0xab1c5ed5u,
@@ -94,7 +96,7 @@ __kernel void mine(ulong base,__global volatile int* found,__global ulong* out){
 """
 
 def mine(ch_hex, diff, check_stale):
-    """Mine the current challenge. Returns a nonce (int) or None (challenge changed / needs re-mining)."""
+    """Mine the current challenge across ALL GPUs. Returns a nonce (int) or None (challenge changed / needs re-mining)."""
     addr_w = struct.unpack(">5I", bytes.fromhex(ADDR[2:]))
     ch_w   = struct.unpack(">8I", bytes.fromhex(ch_hex[2:]))
     ITERS = 4096
@@ -102,25 +104,55 @@ def mine(ch_hex, diff, check_stale):
                 C0=ch_w[0],C1=ch_w[1],C2=ch_w[2],C3=ch_w[3],C4=ch_w[4],C5=ch_w[5],C6=ch_w[6],C7=ch_w[7])
     src = KERNEL
     for k,v in defs.items(): src = src.replace(k, f"{v}u" if k in ("A0","A1","A2","A3","A4","C0","C1","C2","C3","C4","C5","C6","C7") else str(v))
-    prg = cl.Program(ctx, src).build()
-    mf = cl.mem_flags
-    found = np.zeros(1, np.int32); out = np.zeros(1, np.uint64)
-    fg = cl.Buffer(ctx, mf.READ_WRITE|mf.COPY_HOST_PTR, hostbuf=found)
-    og = cl.Buffer(ctx, mf.READ_WRITE|mf.COPY_HOST_PTR, hostbuf=out)
+
+    import threading
+    stop_evt = threading.Event()
+    result = [None, None]      # [winning nonce, error]  (list contents get replaced, typed loosely)
+    stats = [0] * len(GPUS)
+    t0 = time.time()
     GLOBAL = 1<<20; per = GLOBAL*ITERS
-    base = int.from_bytes(os.urandom(6), "big")
-    t0=time.time(); tot=0; last=t0; lastchk=t0
-    while True:
-        prg.mine(q, (GLOBAL,), None, np.uint64(base), fg, og); q.finish()
-        cl.enqueue_copy(q, found, fg); tot+=per; base=(base+per)&((1<<64)-1)
-        now=time.time()
-        if found[0]:
-            cl.enqueue_copy(q, out, og); q.finish(); return int(out[0])
-        if now-last>=5:
-            print(f"  {tot/(now-t0)/1e9:.1f} GH/s  best-effort mining diff {diff}…", flush=True); last=now
-        if now-lastchk>=12 and check_stale():   # challenge changed -> re-mine
-            return None
-        lastchk = now
+    SPACE = 1 << 57            # disjoint nonce space per GPU (no overlap, no double work)
+    base0 = int.from_bytes(os.urandom(6), "big")
+
+    def worker(idx, dev, base):
+        try:
+            ctx = CTXS[dev]; q = cl.CommandQueue(ctx)
+            prg = cl.Program(ctx, src).build()
+            mf = cl.mem_flags
+            found = np.zeros(1, np.int32); out = np.zeros(1, np.uint64)
+            fg = cl.Buffer(ctx, mf.READ_WRITE|mf.COPY_HOST_PTR, hostbuf=found)
+            og = cl.Buffer(ctx, mf.READ_WRITE|mf.COPY_HOST_PTR, hostbuf=out)
+            while not stop_evt.is_set() and result[0] is None:
+                prg.mine(q, (GLOBAL,), None, np.uint64(base), fg, og); q.finish()
+                cl.enqueue_copy(q, found, fg)
+                stats[idx] += per; base = (base + per) & ((1<<64)-1)
+                if found[0]:
+                    cl.enqueue_copy(q, out, og); q.finish()
+                    result[0] = int(out[0]); stop_evt.set(); return
+                now = time.time()
+                if now - t0 >= 5 and idx == 0:
+                    tot = sum(stats)
+                    print(f"  {tot/(now-t0)/1e9:.1f} GH/s (all GPUs)  best-effort mining diff {diff}…", flush=True)
+                    globals()["_last_report"] = now
+        except Exception as e:
+            print(f"  [gpu{idx}] error: {e}", flush=True)
+            result[1] = f"gpu{idx}: {e}"; stop_evt.set()
+
+    threads = []
+    for idx, dev in enumerate(GPUS):
+        t = threading.Thread(target=worker, args=(idx, dev, (base0 + idx*SPACE) & ((1<<64)-1)), daemon=True)
+        t.start(); threads.append(t)
+    try:
+        while any(t.is_alive() for t in threads):
+            time.sleep(0.3)
+            if result[0] is not None or result[1]: break
+            if check_stale():   # challenge changed -> re-mine
+                stop_evt.set(); return None
+    finally:
+        stop_evt.set()
+        for t in threads: t.join(timeout=5)
+    if result[1]: raise SystemExit(f"❌ {result[1]}")
+    return result[0]
 
 def submit(nonce, ch_hex):
     data = SEL_MINE + f"{nonce:064x}" + ch_hex[2:]

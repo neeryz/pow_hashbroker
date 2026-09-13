@@ -25,7 +25,7 @@ export COUNT=1                    # optional, how many to mine (default: keep go
 python hashbroker/hashbroker.py
 ```
 
-Measured on an RTX 5090: ≈ 15.4 GH/s. Expected time to solve = `2^difficulty / hashrate`: difficulty 42 ≈ 5 minutes, doubling with each +1 level.
+Measured on an RTX 5090: ≈ 15.4 GH/s per card. **Multi-GPU is supported**: every OpenCL device found is used automatically — one thread per GPU with disjoint nonce ranges, so N cards ≈ N× the hashrate. Expected time to solve = `2^difficulty / total hashrate`: difficulty 42 ≈ 5 minutes on one 5090, doubling with each +1 level.
 
 To repurpose for another PoW project: edit `RPC / CONTRACT / CHAIN_ID / selectors` at the top of `hashbroker.py`, and verify the preimage layout against that project's frontend.
 
